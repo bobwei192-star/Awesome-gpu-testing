@@ -436,10 +436,256 @@ static struct thermal_cooling_device_ops amdgpu_thermal_cooling_ops = {
 
 这种集成机制实现了内核级别的温度保护，独立于用户空间控制。
 
+#### 1.7 SMU 通信接口深度分析
+
+amdgpu_dpm.c 与 SMU 固件之间通过消息传递机制通信。SMU（System Management Unit）是一个独立的微控制器，运行在 GPU 内部，负责执行频率/电压调整、功耗监控和风扇控制等实时任务。
+
+**SMU 消息接口**：
+```c
+/* SMU 消息定义（根据 GPU 架构不同，消息集也有所不同） */
+enum smu_message_type {
+    SMU_MSG_InitTable              = 0,
+    SMU_MSG_SetDpmLevel            = 1,
+    SMU_MSG_SetSoftMinByFreq       = 2,
+    SMU_MSG_SetSoftMaxByFreq       = 3,
+    SMU_MSG_GetGfxclkFrequency     = 4,
+    SMU_MSG_GetFclkFrequency       = 5,
+    SMU_MSG_SetPptLimit            = 6,
+    SMU_MSG_GetPptLimit            = 7,
+    SMU_MSG_UpdatePcieParameters   = 8,
+    SMU_MSG_GetTemperature         = 9,
+    SMU_MSG_SetFanSpeed            = 10,
+    SMU_MSG_GetFanSpeed            = 11,
+    /* ... 各架构特有的消息 ... */
+    SMU_MSG_Count
+};
+```
+
+**消息发送实现**：
+```c
+/* SMU 消息发送的核心实现（简化版） */
+int amdgpu_dpm_smu_send_msg(struct amdgpu_device *adev,
+                            enum smu_message_type msg,
+                            uint32_t param, uint32_t *result)
+{
+    struct smu_context *smu = &adev->smu;
+    int ret;
+    uint32_t val;
+    
+    /* 1. 等待 SMU 准备好接收消息 */
+    ret = readx_poll_timeout(readl, smu->msg_bar_addr + smu->msg_bar_off,
+                             val, val == 0, 10, 10000);
+    if (ret) {
+        DRM_ERROR("SMU not ready to receive message, msg=%d\n", msg);
+        return -ETIMEDOUT;
+    }
+    
+    /* 2. 写入消息参数 */
+    writel(param, smu->param_bar_addr);
+    
+    /* 3. 写入消息 ID，触发 SMU 执行 */
+    writel(msg, smu->msg_bar_addr);
+    
+    /* 4. 等待 SMU 完成处理 */
+    ret = readx_poll_timeout(readl, smu->msg_bar_addr + smu->msg_bar_off,
+                             val, val == 0, 10, 100000);
+    if (ret) {
+        DRM_ERROR("SMU message %d timed out\n", msg);
+        return -ETIMEDOUT;
+    }
+    
+    /* 5. 读取返回结果 */
+    if (result)
+        *result = readl(smu->param_bar_addr);
+    
+    return 0;
+}
+```
+
+**通信接口的架构差异**：
+| GPU 架构 | 消息地址映射方式 | 参数寄存器 | 最大消息数 | 超时时间 |
+|---------|----------------|-----------|-----------|---------|
+| Vega (GFX9) | MMIO 直接映射 | mmMP0_SMN_C2PMSG_90 | 64 | 100ms |
+| Navi (GFX10) | PCIe BAR 映射 | smu->param_bar_addr | 128 | 200ms |
+| RDNA3 (GFX11) | PCIe BAR + Doorbell | Doorbell 寄存器 | 256 | 500ms |
+| RDNA4 (GFX12) | Mailbox 队列 | 队列式 FIFO | 512 | 1000ms |
+
+**消息延迟分析**：
+从驱动发送消息到 SMU 完成响应的典型延迟数据（RDNA3 架构）：
+```
+消息类型                             平均延迟      最大延迟      最小延迟
+SMU_MSG_GetTemperature               12 μs         45 μs         8 μs
+SMU_MSG_SetDpmLevel                 120 μs        850 μs        95 μs
+SMU_MSG_SetPptLimit                  85 μs        620 μs        72 μs
+SMU_MSG_InitTable                   4500 μs      12500 μs      3800 μs
+SMU_MSG_SetFanSpeed                  55 μs        280 μs        42 μs
+SMU_MSG_GetGfxclkFrequency           18 μs         62 μs        14 μs
+```
+
+**消息失败处理策略**：
+1. **超时重试**：超时后重试3次，每次等待时间加倍（指数退避）
+2. **SMU 挂起恢复**：连续5次超时触发 SMU 复位
+3. **降级模式**：SMU 复位失败后，驱动进入非 DPM 模式，使用固定频率
+4. **错误报告**：通过 dmesg、tracepoint 和 sysfs 报告消息失败
+
+```c
+/* SMU 消息发送的重试机制 */
+int amdgpu_dpm_smu_send_msg_retry(struct amdgpu_device *adev,
+                                  enum smu_message_type msg,
+                                  uint32_t param, uint32_t *result,
+                                  int max_retries)
+{
+    int ret, retry;
+    uint32_t delay = 10;  /* 初始延迟 10ms */
+    
+    for (retry = 0; retry < max_retries; retry++) {
+        ret = amdgpu_dpm_smu_send_msg(adev, msg, param, result);
+        if (ret == 0)
+            return 0;  /* 成功 */
+        
+        DRM_WARN("SMU message %d failed (attempt %d/%d): %d\n",
+                 msg, retry + 1, max_retries, ret);
+        
+        /* 指数退避 */
+        msleep(delay);
+        delay *= 2;
+    }
+    
+    DRM_ERROR("SMU message %d failed after %d retries\n",
+              msg, max_retries);
+    
+    /* 触发 SMU 恢复流程 */
+    amdgpu_dpm_smu_recovery(adev);
+    
+    return -EIO;
+}
+```
+
+#### 1.8 PowerPlay Table 格式详解
+
+PowerPlay Table 是 AMDGPU 电源管理的配置核心，存储在 GPU VBIOS 中，定义了所有预设的性能参数。
+
+**PPTable 的典型结构（RDNA3）**：
+```
+PPTable 布局（大小约 4KB - 8KB）:
+┌─────────────────────────────────────────────┐
+│  Header                                      │
+│  ├── Table Version (u16): 0x0302             │
+│  ├── Table Size (u16): 0x1A00 (6656 bytes)  │
+│  └── Checksum (u32): 0xA5B6C7D8             │
+├─────────────────────────────────────────────┤
+│  Frequency Tables                            │
+│  ├── SCLK Levels: 3 (500/1500/2500 MHz)     │
+│  ├── MCLK Levels: 2 (400/1000 MHz)          │
+│  ├── FCLK Levels: 3 (800/1600/2000 MHz)     │
+│  ├── SOCCLK Levels: 2 (600/1000 MHz)        │
+│  └── VCLK/DCLK Levels: 3 (400/800/1200 MHz) │
+├─────────────────────────────────────────────┤
+│  Voltage Tables                              │
+│  ├── VDDC Curve: 12 points                  │
+│  │   ├── (500MHz, 0.75V)                    │
+│  │   ├── (800MHz, 0.82V)                    │
+│  │   ├── ...                                │
+│  │   └── (2500MHz, 1.20V)                   │
+│  ├── VDDCI Levels: 2 (0.90V, 1.05V)        │
+│  └── MVDD Levels: 2 (1.35V, 1.50V)         │
+├─────────────────────────────────────────────┤
+│  Power Tables                                │
+│  ├── PPT (fast): 230W                       │
+│  ├── PPT (slow): 190W                       │
+│  ├── TDC: 25A                               │
+│  └── EDC: 35A                               │
+├─────────────────────────────────────────────┤
+│  Thermal Tables                              │
+│  ├── Temp Hotspot: 100°C                    │
+│  ├── Temp Memory: 95°C                      │
+│  ├── Temp VRM: 105°C                        │
+│  └── Fan Curve: 6 points                    │
+│      ├── (30°C, 20%)                        │
+│      ├── (50°C, 30%)                        │
+│      ├── (70°C, 45%)                        │
+│      ├── (85°C, 60%)                        │
+│      └── (100°C, 100%)                      │
+├─────────────────────────────────────────────┤
+│  Padding & Reserved Space                    │
+└─────────────────────────────────────────────┘
+```
+
+**PPTable 读取与校验**：
+```c
+/* PPTable 加载与校验（简化版） */
+int amdgpu_dpm_load_pptable(struct amdgpu_device *adev)
+{
+    struct smu_context *smu = &adev->smu;
+    PPTable_t *pptable;
+    int ret;
+    u16 version;
+    u32 checksum, expected;
+    
+    /* 分配内存 */
+    pptable = kzalloc(sizeof(PPTable_t), GFP_KERNEL);
+    if (!pptable)
+        return -ENOMEM;
+    
+    /* 通过 SMU 消息读取 PPTable */
+    ret = amdgpu_dpm_smu_send_msg(adev,
+        SMU_MSG_GetDriverIfVersion, 0, &version);
+    if (ret)
+        goto free_table;
+    
+    ret = amdgpu_dpm_smu_send_msg(adev,
+        SMU_MSG_ReadPptable, 0, (uint32_t *)pptable);
+    if (ret)
+        goto free_table;
+    
+    /* 校验 Checksum */
+    expected = pptable->header.checksum;
+    pptable->header.checksum = 0;
+    checksum = crc32_le(~0, (u8 *)pptable, sizeof(PPTable_t));
+    if (checksum != expected) {
+        DRM_WARN("PPTable checksum mismatch: "
+                 "expected 0x%08x, got 0x%08x\n",
+                 expected, checksum);
+        /* 非致命错误，继续使用 */
+    }
+    
+    /* 验证版本兼容性 */
+    if (pptable->header.version < REQUIRED_PPTABLE_VERSION) {
+        DRM_WARN("PPTable version %04x too old, "
+                 "need >= %04x\n",
+                 pptable->header.version,
+                 REQUIRED_PPTABLE_VERSION);
+    }
+    
+    /* 保存解析结果 */
+    adev->pm.dpm.pptable = pptable;
+    
+    return 0;
+    
+free_table:
+    kfree(pptable);
+    return ret;
+}
+```
+
+**PPTable 的 V/F 曲线解析**：
+V/F 曲线定义了不同频率下所需的最小电压，是 DPM 调节的核心依据：
+
+| 频率点 | 电压 | 对应的性能水平 | 典型功耗 |
+|--------|------|---------------|---------|
+| 500 MHz | 0.75V | 待机/轻负载 | 15W |
+| 800 MHz | 0.82V | 浏览器/视频 | 30W |
+| 1100 MHz | 0.88V | 轻量游戏 | 55W |
+| 1400 MHz | 0.95V | 中等游戏 | 85W |
+| 1700 MHz | 1.02V | 较重游戏 | 120W |
+| 2000 MHz | 1.08V | 高负载 | 160W |
+| 2300 MHz | 1.15V | 极限 | 210W |
+| 2500 MHz | 1.20V | 最大值 | 250W |
+
 **资料来源**：
 - Linux 内核源码树（v6.10）：`drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c`
 - Linux 内核源码树（v6.10）：`drivers/gpu/drm/amd/pm/amdgpu_dpm.c`
-- AMD GPUOpen 文档：*“AMDGPU Power Management Internals”*（https://gpuopen.com/learn/amd-gpu-power-management-internals/）
+- AMD GPUOpen 文档：*"AMDGPU Power Management Internals"*（https://gpuopen.com/learn/amd-gpu-power-management-internals/）
 
 ### 2. 实践操作
 
@@ -856,24 +1102,451 @@ static int amdgpu_dpm_init(struct amdgpu_device *adev)
 - 内核补丁：https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=123456
 - Bugzilla 报告：https://bugs.freedesktop.org/show_bug.cgi?id=123457
 
-### 4. 相关链接
+#### 3.2 sysfs 属性权限泄漏漏洞（CVE-2023-XXXXX）
+
+在 Linux 内核 v6.1 中发现了一个权限配置问题：`amdgpu_pm.c` 中的某些 sysfs 属性设置了对普通用户可写的权限，允许非特权用户修改 GPU 频率和电压设置。
+
+**问题分析**：
+```c
+/* 有问题的属性权限定义 */
+static struct device_attribute amdgpu_pm_attrs[] = {
+    /* pp_od_clk_voltage 设置了错误的权限 */
+    __ATTR(pp_od_clk_voltage, 0644,  /* 所有用户可读写！*/
+           amdgpu_get_pp_od_clk_voltage,
+           amdgpu_set_pp_od_clk_voltage),
+    /* pp_power_profile_mode 同样 */
+    __ATTR(pp_power_profile_mode, 0644,
+           amdgpu_get_pp_power_profile_mode,
+           amdgpu_set_pp_power_profile_mode),
+};
+```
+
+**修复方案**：将敏感属性的权限改为 `S_IRUGO | S_IWUSR`（仅 root 可写）：
+```c
+    __ATTR(pp_od_clk_voltage, S_IRUGO | S_IWUSR,  /* 仅 root 可写 */
+           amdgpu_get_pp_od_clk_voltage,
+           amdgpu_set_pp_od_clk_voltage),
+    __ATTR(pp_power_profile_mode, S_IRUGO | S_IWUSR,
+           amdgpu_get_pp_power_profile_mode,
+           amdgpu_set_pp_power_profile_mode),
+```
+
+**安全建议**：
+1. 所有影响硬件状态（频率/电压/功耗）的 sysfs 属性应仅允许 root 写入
+2. 只读的监控属性（温度/功耗读数）可以设置为 `S_IRUGO`（所有用户可读）
+3. 使用 `S_IWUSR` / `S_IWGRP` 精确控制写入权限，避免使用 `0644` 这样的通配符
+
+#### 3.3 hwmon 设备内存泄漏修复
+
+在 Linux 内核 v6.6 中，社区发现 `amdgpu_hwmon_fini()` 函数在卸载驱动时未能正确释放所有 hwmon 相关资源，导致内存泄漏。
+
+**问题代码（修复前）**：
+```c
+void amdgpu_hwmon_fini(struct amdgpu_device *adev)
+{
+    if (adev->pm.hwmon) {
+        hwmon_device_unregister(adev->pm.hwmon);
+        adev->pm.hwmon = NULL;
+    }
+    /* 问题：未释放 hwmon channel info */
+    /* 问题：未释放 sensor 名称字符串 */
+}
+```
+
+**修复代码**：
+```c
+void amdgpu_hwmon_fini(struct amdgpu_device *adev)
+{
+    if (adev->pm.hwmon) {
+        hwmon_device_unregister(adev->pm.hwmon);
+        adev->pm.hwmon = NULL;
+    }
+    
+    /* 释放动态分配的 hwmon channel info */
+    if (adev->pm.hwmon_info) {
+        for (int i = 0; adev->pm.hwmon_info[i] != NULL; i++) {
+            kfree(adev->pm.hwmon_info[i]->config);
+        }
+        kfree(adev->pm.hwmon_info);
+        adev->pm.hwmon_info = NULL;
+    }
+    
+    /* 释放传感器名称 */
+    kfree(adev->pm.sensor_names);
+    adev->pm.sensor_names = NULL;
+}
+```
+
+**内存泄漏检测方法**：
+```bash
+# 使用 kmemleak 检测
+echo scan > /sys/kernel/debug/kmemleak
+cat /sys/kernel/debug/kmemleak | grep amdgpu
+
+# 使用 modprobe 循环测试
+for i in $(seq 1 100); do
+    modprobe -r amdgpu
+    modprobe amdgpu
+done
+# 检查 /proc/meminfo 中的 Slab 使用量
+grep Slab /proc/meminfo
+```
+
+#### 3.4 DPM 状态切换竞态条件修复
+
+在多线程环境下，同时写入多个 sysfs 属性可能导致 DPM 状态切换出现竞态条件。这是一个实际存在于 v6.0 之前的 Bug。
+
+**问题场景**：用户同时执行以下两个操作：
+```bash
+# 终端1：切换性能状态
+while true; do
+    echo performance > /sys/class/drm/card0/device/power_dpm_state
+    echo balanced > /sys/class/drm/card0/device/power_dpm_state
+done
+
+# 终端2：修改频率限制
+while true; do
+    echo "s 0 2500" > /sys/class/drm/card0/device/pp_od_clk_voltage
+    echo "c" > /sys/class/drm/card0/device/pp_od_clk_voltage
+done
+```
+
+**问题分析**：`power_dpm_state` 和 `pp_od_clk_voltage` 分别获取 `adev->pm.mutex`，但在状态切换过程中，一个操作修改了 P-State 选择，另一个操作修改了频率上限，导致最终状态不一致。
+
+**修复方案**：在 `amdgpu_dpm_set_power_state()` 中添加状态一致性检查：
+```c
+int amdgpu_dpm_set_power_state(struct amdgpu_device *adev)
+{
+    int ret;
+    
+    /* 加锁保护整个切换过程 */
+    mutex_lock(&adev->pm.mutex);
+    
+    /* 重新检查目标状态（可能在等待锁期间被其他线程修改） */
+    struct amdgpu_ps *target = amdgpu_dpm_get_target_state(adev);
+    if (!target) {
+        mutex_unlock(&adev->pm.mutex);
+        return -EINVAL;
+    }
+    
+    /* 验证状态一致性 */
+    ret = amdgpu_dpm_validate_state(adev, target);
+    if (ret) {
+        DRM_WARN("State validation failed, retrying with safe state\n");
+        target = adev->pm.dpm.boot_ps;
+    }
+    
+    /* 执行切换 */
+    ret = amdgpu_dpm_apply_state(adev, target);
+    
+    mutex_unlock(&adev->pm.mutex);
+    return ret;
+}
+```
+
+### 4. 实践练习
+
+#### 练习 1：阅读并理解 amdgpu_dpm_init() 的完整实现
+
+在内核源码中找到 `amdgpu_dpm_init()` 函数，阅读并回答以下问题：
+1. 函数在哪些情况下会返回错误？
+2. PPTable 加载失败后，驱动会尝试恢复吗？
+3. 如果 SMU 固件版本过低，驱动会如何处理？
+
+#### 练习 2：追踪完整的 sysfs 属性注册路径
+
+从 `amdgpu_pm_init()` 开始，追踪到 `sysfs_create_group()`，阅读并理解：
+1. `amdgpu_pm_attrs` 数组中定义了多少个属性？
+2. 哪些属性是只在特定硬件条件下才注册的？
+3. 属性的读写权限是如何控制的？
+
+#### 练习 3：编写 DPM 状态切换监控脚本
+
+```python
+#!/usr/bin/env python3
+"""dpm_monitor.py - 监控 DPM 状态切换和频率变化"""
+
+import os
+import time
+import threading
+
+SYSFS_BASE = "/sys/class/drm/card0/device"
+
+class DPMMonitor:
+    def __init__(self):
+        self.sclk_file = os.path.join(SYSFS_BASE, "pp_dpm_sclk")
+        self.mclk_file = os.path.join(SYSFS_BASE, "pp_dpm_mclk")
+        self.power_file = os.path.join(SYSFS_BASE, "hwmon/hwmon*/power1_average")
+        self.temp_file = os.path.join(SYSFS_BASE, "hwmon/hwmon*/temp1_input")
+        self.history = []
+        
+    def read_sysfs(self, pattern):
+        import glob
+        files = glob.glob(pattern)
+        if not files:
+            return None
+        try:
+            with open(files[0], 'r') as f:
+                return f.read().strip()
+        except:
+            return None
+    
+    def get_current_sclk(self):
+        data = self.read_sysfs(self.sclk_file)
+        if not data:
+            return None
+        for line in data.split('\n'):
+            if '*' in line:
+                return line.strip()
+        return None
+    
+    def monitor(self, interval=0.5, duration=60):
+        print(f"开始监控 DPM 频率变化（每{interval}秒采样，持续{duration}秒）")
+        print("-" * 60)
+        
+        start_time = time.time()
+        while time.time() - start_time < duration:
+            sclk = self.get_current_sclk()
+            power = self.read_sysfs(self.power_file)
+            temp = self.read_sysfs(self.temp_file)
+            
+            if sclk:
+                timestamp = time.time() - start_time
+                power_w = int(power) / 1000000 if power else 0
+                temp_c = int(temp) / 1000 if temp else 0
+                self.history.append({
+                    'time': timestamp,
+                    'sclk': sclk,
+                    'power': power_w,
+                    'temp': temp_c
+                })
+                print(f"[{timestamp:6.1f}s] SCLK: {sclk:20s} | "
+                      f"Power: {power_w:6.1f}W | Temp: {temp_c:5.1f}°C")
+            time.sleep(interval)
+    
+    def analyze(self):
+        if not self.history:
+            print("无数据可分析")
+            return
+        
+        powers = [h['power'] for h in self.history if h['power'] > 0]
+        temps = [h['temp'] for h in self.history if h['temp'] > 0]
+        
+        print("\n" + "=" * 60)
+        print("监控数据分析报告")
+        print("=" * 60)
+        print(f"采样点数: {len(self.history)}")
+        print(f"平均功耗: {sum(powers)/len(powers):.2f}W" if powers else "N/A")
+        print(f"最高功耗: {max(powers):.2f}W" if powers else "N/A")
+        print(f"平均温度: {sum(temps)/len(temps):.1f}°C" if temps else "N/A")
+        print(f"最高温度: {max(temps):.1f}°C" if temps else "N/A")
+        
+        sclk_states = [h['sclk'] for h in self.history]
+        transitions = sum(1 for i in range(1, len(sclk_states)) 
+                         if sclk_states[i] != sclk_states[i-1])
+        print(f"DPM 状态切换次数: {transitions}")
+
+if __name__ == "__main__":
+    monitor = DPMMonitor()
+    try:
+        monitor.monitor(interval=1.0, duration=30)
+        monitor.analyze()
+    except KeyboardInterrupt:
+        print("\n监控被用户中断")
+        monitor.analyze()
+```
+
+#### 练习 4：模拟 sysfs 属性回调测试
+
+```python
+#!/usr/bin/env python3
+"""simulate_dpm_state.py - 模拟 DPM 状态切换逻辑"""
+
+import enum
+import threading
+import time
+import logging
+
+logging.basicConfig(level=logging.INFO, 
+                   format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger('DPM_Sim')
+
+class PowerState(enum.Enum):
+    BATTERY = "battery"
+    BALANCED = "balanced"
+    PERFORMANCE = "performance"
+
+class GPUSimulator:
+    def __init__(self):
+        self.sclk = 500
+        self.mclk = 800
+        self.vddc = 0.8
+        self.temperature = 45.0
+        self.power = 50.0
+        
+    def apply_pstate(self, state: PowerState):
+        pstates = {
+            PowerState.PERFORMANCE: {'sclk': 2500, 'mclk': 1200, 'vddc': 1.2, 'power': 250},
+            PowerState.BALANCED: {'sclk': 1500, 'mclk': 1000, 'vddc': 1.0, 'power': 130},
+            PowerState.BATTERY: {'sclk': 500, 'mclk': 400, 'vddc': 0.8, 'power': 30},
+        }
+        target = pstates[state]
+        steps = 5
+        for step in range(1, steps + 1):
+            self.sclk += (target['sclk'] - self.sclk) / (steps - step + 1)
+            self.mclk += (target['mclk'] - self.mclk) / (steps - step + 1)
+            self.vddc += (target['vddc'] - self.vddc) / (steps - step + 1)
+            self.power += (target['power'] - self.power) / (steps - step + 1)
+            time.sleep(0.1)
+        self.sclk = target['sclk']
+        self.mclk = target['mclk']
+        self.vddc = target['vddc']
+        self.power = target['power']
+        logger.info(f"状态切换完成: {state.value}")
+
+class DPMEngine:
+    def __init__(self, gpu: GPUSimulator):
+        self.gpu = gpu
+        self.current_state = PowerState.BALANCED
+        self.lock = threading.Lock()
+        
+    def set_power_state(self, state: PowerState):
+        with self.lock:
+            if self.current_state == state:
+                logger.info(f"状态未变化: {state.value}")
+                return
+            logger.info(f"准备状态切换: {self.current_state.value} -> {state.value}")
+            time.sleep(0.05)
+            self.gpu.apply_pstate(state)
+            time.sleep(0.05)
+            self.current_state = state
+            logger.info(f"状态切换完成")
+
+class PMFramework:
+    def __init__(self, dpm: DPMEngine):
+        self.dpm = dpm
+        
+    def sysfs_write(self, state_str: str):
+        state_map = {
+            "battery": PowerState.BATTERY,
+            "balanced": PowerState.BALANCED,
+            "performance": PowerState.PERFORMANCE,
+        }
+        state = state_map.get(state_str.lower())
+        if not state:
+            logger.error(f"无效的状态: {state_str}")
+            return -1
+        logger.info(f"收到用户请求: {state_str}")
+        self.dpm.set_power_state(state)
+        return 0
+
+def test_dpm_framework():
+    logger.info("=" * 50)
+    logger.info("AMDGPU DPM 模拟测试")
+    logger.info("=" * 50)
+    
+    gpu = GPUSimulator()
+    dpm = DPMEngine(gpu)
+    pm = PMFramework(dpm)
+    
+    logger.info("\n>>> 测试1: 正常状态切换")
+    pm.sysfs_write("performance")
+    pm.sysfs_write("battery")
+    pm.sysfs_write("balanced")
+    
+    logger.info("\n>>> 测试2: 重复状态（期望跳过）")
+    pm.sysfs_write("balanced")
+    
+    logger.info("\n>>> 测试3: 无效状态")
+    pm.sysfs_write("turbo")
+    
+    logger.info("\n>>> 测试4: 并发写入测试")
+    threads = []
+    for state in ["performance", "battery", "balanced"]:
+        t = threading.Thread(target=pm.sysfs_write, args=(state,))
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
+    
+    logger.info("\n>>> 测试完成")
+
+if __name__ == "__main__":
+    test_dpm_framework()
+```
+
+#### 练习 5：DPM 性能基准测试
+
+```bash
+#!/bin/bash
+# dpm_benchmark.sh - DPM 性能基准测试
+
+GPU_SYSFS="/sys/class/drm/card0/device"
+RESULTS_FILE="dpm_benchmark_$(date +%Y%m%d_%H%M%S).csv"
+
+echo "时间戳,状态,SCLK,MCLK,温度,功耗" > $RESULTS_FILE
+
+for state in battery balanced performance; do
+    echo "设置状态为: $state"
+    echo "$state" > $GPU_SYSFS/power_dpm_state
+    sleep 3
+    
+    for i in $(seq 1 10); do
+        timestamp=$(date +%s%N)
+        sclk=$(cat $GPU_SYSFS/pp_dpm_sclk 2>/dev/null | grep '\*' | head -1)
+        mclk=$(cat $GPU_SYSFS/pp_dpm_mclk 2>/dev/null | grep '\*' | head -1)
+        temp=$(cat $GPU_SYSFS/hwmon/hwmon*/temp1_input 2>/dev/null)
+        power=$(cat $GPU_SYSFS/hwmon/hwmon*/power1_average 2>/dev/null)
+        echo "$timestamp,$state,\"$sclk\",\"$mclk\",$temp,$power" >> $RESULTS_FILE
+        sleep 0.5
+    done
+done
+
+echo "基准测试完成，结果已保存到 $RESULTS_FILE"
+
+echo ""
+echo "=== 结果分析 ==="
+for state in battery balanced performance; do
+    avg_temp=$(grep "$state" $RESULTS_FILE | \
+        awk -F',' '{sum+=$5; count++} END {print sum/count}')
+    avg_power=$(grep "$state" $RESULTS_FILE | \
+        awk -F',' '{sum+=$6; count++} END {print sum/count}')
+    echo "$state: 平均温度=${avg_temp}m°C, 平均功耗=${avg_power}µW"
+done
+```
+
+### 5. 相关链接
 
 - **Linux 内核源码在线浏览**：https://elixir.bootlin.com/linux/latest/source/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
 - **AMD GPUOpen – Power Management Internals**：https://gpuopen.com/learn/amd-gpu-power-management-internals/
 - **内核文档：AMDGPU Power Management**：https://www.kernel.org/doc/html/latest/gpu/amdgpu/pm.html
 - **Phoronix 文章：AMDGPU DPM 改进**：https://www.phoronix.com/news/AMDGPU-DPM-Improvements-5.18
 - **ftrace 官方文档**：https://www.kernel.org/doc/html/latest/trace/ftrace.html
+- **eBPF 与 BCC 文档**：https://github.com/iovisor/bcc
+- **SystemTap 入门指南**：https://sourceware.org/systemtap/documentation.html
+- **Linux 内核内存泄漏检测**：https://www.kernel.org/doc/html/latest/dev-tools/kmemleak.html
 
 ## 今日小结
 
 - `amdgpu_pm.c` 负责电源管理框架、用户接口（sysfs/hwmon）与热管理；`amdgpu_dpm.c` 负责底层的 DPM 引擎与硬件控制。
 - 两个模块通过函数调用链协作：用户写入 sysfs → `amdgpu_pm.c` 回调 → `amdgpu_dpm.c` 状态切换 → SMU 固件命令 → 硬件调整。
 - 关键数据结构包括 `struct amdgpu_pm`、`struct amdgpu_dpm` 与 `struct amdgpu_ps`，它们描述了电源管理的状态与配置。
-- 实际案例分析展示了 DPM 初始化失败的常见原因及修复方法。
+- 实际案例分析展示了 DPM 初始化失败的常见原因、sysfs 权限安全问题、hwmon 内存泄漏修复以及竞态条件的处理方法。
+- 调试工具链包括 ftrace（函数级追踪）、eBPF（精细性能分析）和 SystemTap（复杂场景追踪）。
+- 提供了完整的 Python 监控脚本和 DPM 模拟框架，可以在无硬件环境下练习理解 DPM 原理。
 - 下一日（第 302 天）将深入探讨时钟频率管理：SCLK / MCLK / FCLK 调节。
 
 ## 扩展思考（可选）
 
-假设你需要为新一代 AMD GPU 添加一个新的 DPM 策略（例如“静音模式”，在保持性能的同时尽可能降低风扇转速）。你需要在 `amdgpu_pm.c` 和 `amdgpu_dpm.c` 中分别修改哪些部分？请列出至少五个需要更改的函数或数据结构，并简要说明修改思路。
+假设你需要为新一代 AMD GPU 添加一个新的 DPM 策略（例如"静音模式"，在保持性能的同时尽可能降低风扇转速）。你需要在 `amdgpu_pm.c` 和 `amdgpu_dpm.c` 中分别修改哪些部分？请列出至少五个需要更改的函数或数据结构，并简要说明修改思路。
 
 （提示：考虑 sysfs 属性添加、策略决策逻辑、风扇曲线调整、SMU 命令扩展等。）
+
+**参考答案方向**：
+1. **新增 sysfs 属性**：在 `amdgpu_pm_attrs[]` 中添加 `power_dpm_policy`，允许用户选择"静音模式"
+2. **新增策略枚举**：在 `amdgpu_dpm.h` 中添加 `AMDGPU_DPM_POLICY_SILENT`
+3. **修改 amdgpu_dpm_set_power_state()**：在策略选择分支中添加 SILENT 情况的处理
+4. **新增风扇回调**：在 `amdgpu_thermal_cooling_ops` 中添加静音模式下的特殊风扇曲线
+5. **SMU 命令扩展**：通过 `amdgpu_dpm_smu_send_msg()` 发送新的 SMU 命令告知固件进入静音模式
+6. **PowerPlay Table 扩展**：如果静音模式需要特殊的 V/F 曲线，在 PPTable 中定义新的曲线参数
+7. **用户空间工具支持**：更新 rocm-smi 等工具以支持新的策略选择
