@@ -1481,4 +1481,432 @@ static int amdgpu_acpi_atif_probe_backlight(struct amdgpu_device *adev)
 
 4. **用户态脚本临时修复：**
    ```bash
-   #!
+#!/bin/bash
+# /usr/local/bin/brightness_fix.sh
+# 临时修复背光控制 - 通过直接操作 PCI 配置空间
+
+BACKLIGHT_PATH="/sys/class/backlight/amdgpu_bl0/brightness"
+MAX_BRIGHTNESS_PATH="/sys/class/backlight/amdgpu_bl0/max_brightness"
+
+if [ -f "$BACKLIGHT_PATH" ]; then
+    MAX=$(cat "$MAX_BRIGHTNESS_PATH")
+    # 设置为 50% 亮度
+    echo $((MAX / 2)) | sudo tee "$BACKLIGHT_PATH"
+    echo "Brightness set to 50%"
+else
+    echo "amdgpu backlight interface not found"
+    echo "Available backlight interfaces:"
+    ls -la /sys/class/backlight/
+fi
+   ```
+
+5. **内核补丁修复（长期方案）：**
+   ```c
+// 在 amdgpu_acpi.c 中添加回退逻辑
+static int amdgpu_acpi_atif_probe_backlight(struct amdgpu_device *adev)
+{
+    struct amdgpu_atif *atif = &adev->acpi.priv->atif;
+    struct amdgpu_atif_functions *funcs = &atif->functions;
+    int ret;
+
+    // 首先尝试 ATIF 功能 16
+    if (atif->atif_functions_supported[0] & (1 << 16)) {
+        ret = amdgpu_acpi_atif_register_backlight(adev);
+        if (!ret)
+            return 0;
+    }
+
+    // 回退: 检查 ACPI video 接口
+    dev_info(&adev->pdev->dev,
+             "ATIF backlight not available, trying ACPI video...\n");
+    ret = acpi_video_register_backlight();
+    if (ret)
+        dev_warn(&adev->pdev->dev,
+                 "ACPI video backlight registration failed: %d\n", ret);
+
+    return ret;
+}
+   ```
+
+**验证方法：**
+```bash
+# 重启后验证
+ls -la /sys/class/backlight/
+cat /sys/class/backlight/*/brightness
+cat /sys/class/backlight/*/max_brightness
+dmesg | grep -E "backlight|amdgpu.*bl"
+# 调整亮度测试
+echo 100 | sudo tee /sys/class/backlight/amdgpu_bl0/brightness
+```
+
+---
+
+### 4 相关链接
+
+#### 4.1 AMD 官方文档
+
+| 文档名称 | 链接 | 说明 |
+|---------|------|------|
+| AMD ACPI Interface Specification | https://www.amd.com/system/files/TechDocs/51104.pdf | ATIF/ATCS 官方规范 |
+| AMD GPU Product Specifications | https://www.amd.com/en/products/specifications/graphics | GPU 规格参数 |
+| ROCm Documentation | https://rocm.docs.amd.com/ | ROCm 官方文档集 |
+| AMDGPU Driver Documentation | https://docs.amd.com/ | AMDGPU 驱动文档 |
+
+#### 4.2 Linux 内核源码链接
+
+| 文件路径 | 说明 |
+|---------|------|
+| drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c | AMDGPU ACPI 接口主文件 |
+| drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.h | AMDGPU ACPI 头文件 |
+| drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | AMDGPU 设备管理（含 suspend/resume） |
+| drivers/acpi/video.c | ACPI 视频扩展驱动（背光控制） |
+| drivers/acpi/osl.c | ACPI 操作系统服务层 |
+| include/acpi/actypes.h | ACPI 数据类型定义 |
+| include/linux/acpi.h | Linux ACPI 接口头文件 |
+
+#### 4.3 内核文档
+
+| 文档 | 说明 |
+|-----|------|
+| Documentation/power/runtime_pm.txt | 运行时电源管理文档 |
+| Documentation/admin-guide/acpi/ | ACPI 管理员指南 |
+| Documentation/admin-guide/kernel-parameters.txt | 内核参数说明 |
+| Documentation/driver-api/pm/ | 驱动电源管理 API 文档 |
+
+#### 4.4 工具与调试资源
+
+| 工具 | 用途 | 安装方式 |
+|-----|------|---------|
+| acpidump | 导出 ACPI 表 | apt install acpica-tools |
+| iasl | ACPI 表反编译器/编译器 | apt install acpica-tools |
+| acpi_listen | 监听 ACPI 事件 | apt install acpid |
+| dmidecode | 查看 DMI/BIOS 信息 | apt install dmidecode |
+| turbostat | 查看处理器 C 状态 | apt install linux-tools-common |
+
+---
+
+### 5 今日小结
+
+**本日主要内容回顾：**
+
+1. **ACPI 标准基础：** 了解了 ACPI 电源管理状态（全局/设备/睡眠状态）和核心表类型（RSDP、RSDT、DSDT、SSDT、FADT）。
+
+2. **amdgpu_acpi.c 架构：** 分析了 AMDGPU 驱动的 ACPI 接口层的核心数据结构 `amdgpu_acpi_priv`、初始化流程和数据流路径。
+
+3. **ATIF（AMD Technology Interface）：** 掌握了 ATIF 的功能集、`atif_get_sbios_requests()` 轮询机制和事件处理流程，以及 ACPI 通知事件处理（GPE 中断 → amdgpu_acpi_event_handler → 事件分类处理）。
+
+4. **ATCS（AMD Technology Control Services）：** 学习了 ATCS 的主要功能，包括外部电源状态检测、系统散热模式切换和 PCIe 链路宽度协商。
+
+5. **ACPI _DSM 方法：** 理解了 _DSM 方法的调用规范、UUID 与 Function Index 的映射关系，以及如何通过 ASL 代码实现 _DSM。
+
+6. **背光控制：** 掌握了 ATIF 背光接口的工作原理、`amdgpu_acpi_atif_probe_backlight()` 检测逻辑和背光接口选择策略。
+
+7. **系统挂起/恢复：** 分析了 S3 挂起和唤醒的完整流程，包括各阶段调用的关键函数和通知送达机制。
+
+**重点掌握：**
+- amdgpu_acpi.c 中 ATIF/ATCS 的初始化流程
+- ACPI 通知事件的处理路径
+- 背光控制的 ACPI 实现机制
+- S3/S0ix 状态切换过程中 GPU 驱动的 ACPI 交互
+- _DSM 方法的封装和调用方式
+
+**常见问题排查思路：**
+- 背光失效 → 检查 ATIF 功能位图 → 检查内核参数 → 检查 sysfs 接口
+- 挂起恢复失败 → 检查 dmesg → 检查 ACPI 通知 → 检查 GPU 电源状态 → 尝试内核参数
+- AC/DC 切换性能异常 → 检查 ATIF 通知 → 检查电源策略切换 → 检查 _DSM 返回值
+
+---
+
+### 6 扩展思考
+
+1. **ACPI 与 UEFI 的关系：** ACPI 固件接口和 UEFI 运行时服务在电源管理中如何协同工作？UEFI 的 `GetVariable`/`SetVariable` 在 GPU 电源管理中有什么应用场景？
+
+2. **S0ix 与 S3 的竞争：** 现代 AMD 平台逐渐推广 S0ix（Modern Standby）替代传统 S3，这对 amdgpu_acpi.c 的实现有何影响？ACPI 通知处理方面需要做哪些适配改动？
+
+3. **虚拟化场景下的 ACPI：** 在 GPU 透传（VFIO passthrough）场景中，宿主机的 ACPI 电源事件如何传递给虚拟机中的 AMDGPU 驱动？有哪些架构上的挑战？
+
+4. **ACPI 调试的极限手段：** 当操作系统的 ACPI 驱动与 BIOS 的 ASL 代码存在兼容性问题时，可以考虑的调试手段有哪些？（如 DSDT override、ACPI 日志等级调整、AML 断点调试等）。
+
+5. **跨平台 ACPI 差异：** AMD 的 ACPI 接口与 NVIDIA 的 ACPI 实现（如 _DSM 用于 PCIe 电源管理）有哪些异同？Intel 的 _DSM（如 Intel DPTF）又有什么不同的设计思路？
+
+---
+
+### 附录
+
+#### A. 工具安装脚本
+
+```bash
+#!/bin/bash
+# install_acpi_tools.sh - 安装 ACPI 调试工具集
+
+echo "Installing ACPI debugging tools..."
+
+# Debian/Ubuntu
+if command -v apt &> /dev/null; then
+    sudo apt update
+    sudo apt install -y \
+        acpica-tools \
+        acpid \
+        dmidecode \
+        cpuid \
+        linux-tools-common \
+        linux-tools-$(uname -r) \
+        pm-utils \
+        powertop
+fi
+
+# RHEL/CentOS/Fedora
+if command -v dnf &> /dev/null; then
+    sudo dnf install -y \
+        acpica-tools \
+        acpid \
+        dmidecode \
+        cpuid \
+        kernel-tools \
+        pm-utils \
+        powertop
+fi
+
+echo "Verifying installation..."
+for tool in acpidump iasl acpi_listen dmidecode turbostat; do
+    if command -v $tool &> /dev/null; then
+        echo "  ✓ $tool installed"
+    else
+        echo "  ✗ $tool not found"
+    fi
+done
+```
+
+#### B. ACPI 调试命令速查表
+
+| 目的 | 命令 | 说明 |
+|------|------|------|
+| 导出所有 ACPI 表 | `acpidump > acpi_dump.dat` | 以二进制格式导出所有 ACPI 表 |
+| 反编译 DSDT | `acpidump -o dsdt.dat && iasl -d dsdt.dat` | 生成 dsdt.dsl 可读 ASL 源码 |
+| 查看 DSDT 版本 | `iasl -g dsdt.dat -d | head -20` | 确认 DSDT 表 OEM ID 和版本 |
+| 反编译 SSDT | `acpidump | grep SSDT` | 提取 SSDT 表二进制数据 |
+| 查看当前电源状态 | `cat /sys/power/state` | 显示支持的系统睡眠状态 |
+| 查看 ACPI 版本 | `dmesg | grep -i acpi.*version` | 内核启动时检测的 ACPI 版本 |
+| 查看 GPU ACPI 信息 | `sudo cat /sys/kernel/debug/dri/0/name` | 确认 GPU 设备名称 |
+| 监控 ACPI 事件 | `acpi_listen` | 实时监听 ACPI 事件 |
+| 查看 DSDT 中的 ATIF | `grep -i "ATIF\|AMDIF" dsdt.dsl` | 在反编译的 DSDT 中搜索 ATIF UUID |
+| 触发 S3 睡眠 | `sudo rtcwake -m mem -s 30` | 30 秒后自动唤醒 |
+| 触发 S0ix 测试 | `sudo rtcwake -m freeze -s 30` | 30 秒后从 S0ix 唤醒 |
+| 禁用 ACPI 事件监听 | `acpi=off` (内核参数) | 禁用所有 ACPI（仅调试用） |
+
+#### C. 相关内核参数参考
+
+| 参数 | 说明 | 适用场景 |
+|-----|------|---------|
+| `acpi=off` | 禁用所有 ACPI | 调试 ACPI 相关问题（极端手段） |
+| `acpi_osi=!Windows 2013` | 修改 ACPI OSI 字符串 | 触发不同的 DSDT 代码路径 |
+| `acpi_backlight=video` | 优先使用 ACPI video 背光接口 | 背光控制失效 |
+| `acpi_backlight=native` | 优先使用原生 GPU 背光接口 | ACPI video 背光效果差 |
+| `acpi_sleep=s3_bios` | S3 睡眠前调用 BIOS | BIOS S3 兼容性问题 |
+| `acpi_sleep=s3_mode` | S3 使用 BIOS 模式切换 | S3 恢复失败 |
+| `acpi.power_nocheck=1` | 跳过 ACPI 电源状态检查 | 电源状态切换卡死 |
+| `amdgpu.abmlevel=N` | 设置 AMDGPU 背光等级（0-4） | 背光控制调试 |
+| `drm.debug=0x1f` | 开启 DRM 层详细日志 | GPU 整体调试 |
+
+#### D. 快速检查清单
+
+在进行 ACPI 相关 GPU 问题排查时，建议按以下顺序检查：
+
+```bash
+#!/bin/bash
+# acpi_quick_check.sh - ACPI GPU 环境快速检查脚本
+
+echo "=== ACPI GPU 环境检查 ==="
+echo ""
+
+echo "1. 系统电源状态支持:"
+cat /sys/power/state 2>/dev/null || echo "  (无法访问)"
+
+echo ""
+echo "2. GPU设备ACPI信息:"
+for dev in /sys/bus/pci/devices/*/; do
+    if [ -f "$dev/vendor" ] && [ "$(cat "$dev/vendor")" = "0x1002" ]; then
+        echo "  AMD GPU found: $(basename "$dev")"
+        echo "    Driver: $(basename "$(readlink "$dev/driver" 2>/dev/null)" 2>/dev/null)"
+        echo "    Power control: $(cat "$dev/power/control" 2>/dev/null)"
+        echo "    ACPI path: $(cat "$dev/firmware_node/path" 2>/dev/null)"
+    fi
+done
+
+echo ""
+echo "3. 背光接口:"
+ls /sys/class/backlight/ 2>/dev/null || echo "  无背光接口"
+
+echo ""
+echo "4. AMDGPU ACPI 状态:"
+dmesg | grep -E "amdgpu.*acpi|amdgpu.*ATIF|amdgpu.*ATCS|amdgpu.*DSM" 2>/dev/null | tail -20
+
+echo ""
+echo "5. 内核 ACPI 配置:"
+cat /boot/config-$(uname -r) 2>/dev/null | grep -E "CONFIG_ACPI=" || echo "  无法读取内核配置"
+cat /proc/cmdline 2>/dev/null | tr ' ' '\n' | grep -E "acpi|amdgpu"
+
+echo ""
+echo "=== 检查完成 ==="
+```
+
+---
+
+> **作者注：** 本文档中涉及的内核源码分析基于 Linux 6.x 系列内核。ACPI 规范和 AMD 专用接口的具体实现可能因内核版本和固件版本而异，请以实际使用的版本为准。在排查 ACPI 相关问题时，始终优先查阅官方 ACPI 规范和 AMD 提供的技术文档。
+
+---
+
+### E. ACPI Event Debugging Reference
+
+```bash
+# ============================================================
+# ACPI Event Debugging One-Liners
+# ============================================================
+
+# Monitor all ACPI events in real-time
+sudo acpi_listen
+
+# Watch AMDGPU-specific ACPI events
+sudo acpi_listen | grep -i amd
+
+# Monitor ACPI GPE (General Purpose Event) status
+sudo cat /sys/firmware/acpi/interrupts/gpe*
+
+# Check ACPI interrupt statistics
+sudo cat /proc/interrupts | grep acpi
+
+# Enable ACPI debug logging
+sudo sh -c 'echo 0xFFFFFFFF > /sys/module/acpi/parameters/debug_level'
+sudo sh -c 'echo 0xFFFFFFFF > /sys/module/acpi/parameters/debug_layer'
+
+# Monitor power state transitions in real-time
+sudo dmesg -w | grep -E "suspend|resume|ACPI|amdgpu.*pm"
+
+# Check S0ix residency
+sudo cat /sys/kernel/debug/pmc_core/slp_s0_residency_usec
+
+# Dump ACPI namespace for AMDGPU devices
+sudo find /sys/firmware/acpi/ -name "*" -type f -exec grep -l "AMD\|1002" {} \; 2>/dev/null
+
+# Check device power state
+for dev in /sys/bus/pci/devices/*; do
+    if [ -f "$dev/vendor" ] && grep -q "1002" "$dev/vendor" 2>/dev/null; then
+        echo "$(basename $dev): power_state=$(cat $dev/power_state 2>/dev/null)"
+    fi
+done
+
+# Force GPU D3 state for testing
+echo 3 | sudo tee /sys/bus/pci/devices/0000:04:00.0/power/state 2>/dev/null
+```
+
+### F. ASL Code Snippets for Reference
+
+The following ASL code shows how ATIF is typically declared in a system's DSDT:
+
+```asl
+// AMD ACPI ATIF Method - Typical declaration in DSDT
+Scope (\_SB.PCI0.GPXV)
+{
+    Method (ATIF, 1, Serialized)
+    {
+        // Input: Package containing Function Index and Arguments
+        // Output: Package containing return values
+        
+        // Local variables
+        Local0 = Arg0
+        Local1 = 0
+        
+        // Check function index and dispatch
+        Switch (DerefOf(Local0[0]))
+        {
+            // Function 0: Query ATIF support
+            Case (0)
+            {
+                Local1 = Buffer(16) { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+                Return (Local1)
+            }
+            
+            // Function 1: Get system request
+            Case (1)
+            {
+                Local1 = Buffer(32) { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+                Return (Local1)
+            }
+            
+            // Function 16: Backlight control
+            Case (16)
+            {
+                Local1 = Buffer(4) { 0xFF, 0xFF, 0xFF, 0xFF }
+                Return (Local1)
+            }
+        }
+        
+        Return (Buffer(1) { 0x00 })
+    }
+}
+```
+
+### G. ACPI Power State Transition Matrix
+
+```
+                     System Power States (Sx)
+                 ┌────────────────────────────────────────────────────────────┐
+                 │    S0            S0ix          S3           S4        S5  │
+                 │  (Working)    (Modern       (Suspend     (Hibernate)(Soft │
+                 │               Standby)       to RAM)                Off)  │
+┌────────────────┼────────────────────────────────────────────────────────────┤
+│ GPU D0 (Active)│     ✓            ✗            ✗           ✗         ✗    │
+│                │  Full power    Entering     Preparing   Saving     Not   │
+│                │  operation     low-power    for suspend state to   powered│
+│                │                state                                    │
+├────────────────┼────────────────────────────────────────────────────────────┤
+│ GPU D3hot     │     ✗            ✓            ✓           ✗         ✗    │
+│ (Soft Off)     │              PCIe link    PCIe link              Not     │
+│                │              active but   active but             applicable│
+│                │              device in    device in                       │
+│                │              low-power    D3hot                           │
+├────────────────┼────────────────────────────────────────────────────────────┤
+│ GPU D3cold    │     ✗            ✗            ✗           ✓         ✓    │
+│ (Power Off)    │                                            PCIe Vaux   No  │
+│                │                                            only        power│
+└────────────────┴────────────────────────────────────────────────────────────┘
+```
+
+### H. ACPI Debug Logging Levels
+
+| Level | Value | Description |
+|-------|-------|-------------|
+| ACPI_DEBUG_LEVEL_ERROR | 0x00000001 | Fatal errors |
+| ACPI_DEBUG_LEVEL_WARN | 0x00000002 | Warnings |
+| ACPI_DEBUG_LEVEL_INFO | 0x00000004 | General information |
+| ACPI_DEBUG_LEVEL_VERBOSE | 0x00000008 | Verbose debugging |
+| ACPI_DEBUG_LEVEL_FUNCTIONS | 0x00000010 | Function entry/exit |
+| ACPI_DEBUG_LEVEL_ALL | 0xFFFFFFFF | All debug messages |
+
+| Layer | Value | Description |
+|-------|-------|-------------|
+| ACPI_UTILITIES | 0x00000001 | Utility functions |
+| ACPI_HARDWARE | 0x00000002 | Hardware interface |
+| ACPI_EVENTS | 0x00000004 | Event handling |
+| ACPI_NAMESPACE | 0x00000008 | Namespace management |
+| ACPI_POWER | 0x00000020 | Power management |
+| ACPI_SYSTEM | 0x00000080 | OS service interface |
+| ACPI_ALL | 0x00000001 | All layers |
+
+**Usage Example:**
+```bash
+# Enable ACPI power + event debug
+echo 0x00000024 | sudo tee /sys/module/acpi/parameters/debug_level
+echo 0x00000024 | sudo tee /sys/module/acpi/parameters/debug_layer
+dmesg -w | grep -E "ACPI|amdgpu"
+```
+
+---
+
+*文档创建于第 313 天，主题：amdgpu_acpi.c：ACPI接口与GPU电源事件*
+
+
