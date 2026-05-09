@@ -1515,7 +1515,153 @@ for state in battery balanced performance; do
 done
 ```
 
-### 5. 相关链接
+### 5. 练习六：DPM 驱动调试实战模拟
+
+无需真实硬件，使用以下模拟环境练习 DPM 调试技巧：
+
+```python
+#!/usr/bin/env python3
+"""dpm_debug_simulator.py - DPM 调试模拟器"""
+
+import random
+import time
+import threading
+import logging
+
+logging.basicConfig(level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger('DPM_Debug')
+
+class DPMDebugSimulator:
+    """模拟 DPM 调试场景"""
+    
+    def __init__(self):
+        self.smu_healthy = True
+        self.pptable_corrupt = False
+        self.race_condition = False
+        self.sclk_levels = [500, 1500, 2500]
+        self.current_level = 0
+        self.lock = threading.Lock()
+        
+    def inject_fault_smu_timeout(self, probability=0.3):
+        """注入 SMU 超时故障"""
+        if random.random() < probability:
+            logger.warning("SMU 消息超时 (模拟)")
+            raise TimeoutError("SMU message timeout")
+        return True
+    
+    def inject_fault_pptable_corrupt(self):
+        """注入 PPTable 损坏故障"""
+        if self.pptable_corrupt:
+            logger.error("PPTable checksum 错误")
+            return False
+        return True
+    
+    def simulate_dpm_init(self):
+        """模拟 DPM 初始化流程"""
+        logger.info("开始 DPM 初始化...")
+        
+        # 步骤 1: 获取 SMU 固件版本
+        try:
+            if not self.smu_healthy:
+                raise RuntimeError("SMU 未响应")
+            logger.info("  [OK] SMU 固件版本: v0x0302")
+        except Exception as e:
+            logger.error(f"  [FAIL] SMU 版本获取失败: {e}")
+            return False
+        
+        # 步骤 2: 加载 PPTable
+        if not self.inject_fault_pptable_corrupt():
+            logger.warning("  [WARN] 使用默认 PPTable")
+        else:
+            logger.info("  [OK] PPTable 加载成功 (6656 bytes)")
+        
+        # 步骤 3: 初始化 DPM 状态
+        self.current_level = 0
+        logger.info(f"  [OK] DPM 状态初始化完成 (level={self.current_level})")
+        
+        logger.info("DPM 初始化完成")
+        return True
+    
+    def simulate_state_transition(self, target_level):
+        """模拟状态切换"""
+        with self.lock:
+            logger.info(f"状态切换: {self.current_level} -> {target_level}")
+            
+            # 模拟 pre_set
+            logger.debug("  [pre] 暂停调度器...")
+            time.sleep(0.1)
+            
+            # 模拟 switch
+            try:
+                self.inject_fault_smu_timeout()
+                self.current_level = target_level
+                logger.info(f"  [switch] 频率: {self.sclk_levels[target_level]}MHz")
+            except TimeoutError:
+                logger.error("  [switch] SMU 超时，尝试降级")
+                return False
+            
+            # 模拟 post_set
+            logger.debug("  [post] 恢复调度器...")
+            time.sleep(0.1)
+            
+            return True
+    
+    def diagnose_current_state(self):
+        """诊断当前 DPM 状态"""
+        print("\n=== DPM 诊断报告 ===")
+        print(f"SMU 健康状态: {'正常' if self.smu_healthy else '异常'}")
+        print(f"PPTable 完整性: {'正常' if not self.pptable_corrupt else '损坏'}")
+        print(f"当前 SCLK 级别: {self.current_level} ({self.sclk_levels[self.current_level]}MHz)")
+        print(f"竞态条件保护: {'已启用' if not self.race_condition else '已禁用'}")
+        
+        # 模拟诊断建议
+        if not self.smu_healthy:
+            print("[建议] 检查 SMU 固件版本，考虑重启 SMU")
+        if self.pptable_corrupt:
+            print("[建议] 尝试刷新 VBIOS 或更新固件")
+        if self.race_condition:
+            print("[建议] 检查互斥锁使用，确保正确同步")
+        
+        print("=" * 30)
+
+def run_debug_scenarios():
+    """运行调试场景"""
+    sim = DPMDebugSimulator()
+    
+    # 场景 1: 正常初始化
+    print("\n=== 场景 1: 正常 DPM 初始化 ===")
+    sim.simulate_dpm_init()
+    sim.diagnose_current_state()
+    
+    # 场景 2: SMU 故障
+    print("\n=== 场景 2: SMU 故障注入 ===")
+    sim.smu_healthy = False
+    sim.simulate_dpm_init()
+    sim.diagnose_current_state()
+    
+    # 场景 3: PPTable 损坏
+    print("\n=== 场景 3: PPTable 损坏 ===")
+    sim.smu_healthy = True
+    sim.pptable_corrupt = True
+    sim.simulate_dpm_init()
+    sim.diagnose_current_state()
+    
+    # 场景 4: 状态切换故障
+    print("\n=== 场景 4: 状态切换超时 ===")
+    sim.pptable_corrupt = False
+    sim.simulate_dpm_init()
+    for level in [1, 2, 1, 0]:
+        success = sim.simulate_state_transition(level)
+        if not success:
+            logger.warning(f"切换到 level {level} 失败")
+        time.sleep(0.5)
+
+if __name__ == "__main__":
+    run_debug_scenarios()
+```
+
+### 6. 相关链接
 
 - **Linux 内核源码在线浏览**：https://elixir.bootlin.com/linux/latest/source/drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
 - **AMD GPUOpen – Power Management Internals**：https://gpuopen.com/learn/amd-gpu-power-management-internals/
@@ -1525,6 +1671,9 @@ done
 - **eBPF 与 BCC 文档**：https://github.com/iovisor/bcc
 - **SystemTap 入门指南**：https://sourceware.org/systemtap/documentation.html
 - **Linux 内核内存泄漏检测**：https://www.kernel.org/doc/html/latest/dev-tools/kmemleak.html
+- **Linux 内核锁机制文档**：https://www.kernel.org/doc/html/latest/locking/index.html
+- **AMDGPU 驱动开发指南**：https://dri.freedesktop.org/docs/drm/gpu/amdgpu.html
+- **PCIe BAR 映射文档**：https://www.kernel.org/doc/html/latest/PCI/pci.html
 
 ## 今日小结
 
@@ -1534,6 +1683,10 @@ done
 - 实际案例分析展示了 DPM 初始化失败的常见原因、sysfs 权限安全问题、hwmon 内存泄漏修复以及竞态条件的处理方法。
 - 调试工具链包括 ftrace（函数级追踪）、eBPF（精细性能分析）和 SystemTap（复杂场景追踪）。
 - 提供了完整的 Python 监控脚本和 DPM 模拟框架，可以在无硬件环境下练习理解 DPM 原理。
+- SMU 通信接口分析揭示了驱动与固件之间的消息传递机制和延迟特性。
+- PowerPlay Table 格式详解展示了 V/F 曲线和 P-State 的配置方式。
+- DPM 配置文件调优展示了如何通过 pp_power_profile_mode 调整 DPM 行为倾向。
+- 单元测试框架展示了如何系统性地验证 DPM 逻辑的正确性。
 - 下一日（第 302 天）将深入探讨时钟频率管理：SCLK / MCLK / FCLK 调节。
 
 ## 扩展思考（可选）
@@ -1550,3 +1703,119 @@ done
 5. **SMU 命令扩展**：通过 `amdgpu_dpm_smu_send_msg()` 发送新的 SMU 命令告知固件进入静音模式
 6. **PowerPlay Table 扩展**：如果静音模式需要特殊的 V/F 曲线，在 PPTable 中定义新的曲线参数
 7. **用户空间工具支持**：更新 rocm-smi 等工具以支持新的策略选择
+
+**进阶问题**：
+1. 如果 SMU 固件不支持新的静音模式命令，驱动应如何优雅降级？
+2. 静音模式下的 V/F 曲线应如何设计才能在降低风扇噪音的同时保持足够的性能？
+3. 如何在静音模式下平衡 CPU 和 GPU 的功耗分配？
+4. 静音模式的功耗限制（PPT）应该比平衡模式低多少才合理？
+5. 如何通过实际的噪音测量（分贝）来验证静音模式的效果？
+
+#### 练习七：阅读内核补丁提交历史
+
+通过阅读 amdgpu_pm.c 和 amdgpu_dpm.c 的 git 提交历史，可以了解驱动程序的发展脉络：
+
+```bash
+# 在 Linux 内核仓库中执行
+cd linux
+
+# 查看 amdgpu_pm.c 的提交历史（前 20 条）
+git log --oneline --follow -20 drivers/gpu/drm/amd/amdgpu/amdgpu_pm.c
+
+# 查看 amdgpu_dpm.c 的提交历史
+git log --oneline --follow -20 drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+
+# 搜索修复 DPM 相关 Bug 的提交
+git log --all --oneline --grep="DPM" -- drivers/gpu/drm/amd/
+
+# 查看某次提交的详细变更
+git show <commit-hash> --stat
+```
+
+**练习目标**：
+1. 找到 amdgpu_pm.c 中最早的提交，了解文件的创建历史
+2. 统计过去一年中与 DPM 相关的修复次数
+3. 找出涉及 SMU 通信接口修改的提交
+4. 分析 hwmon 接口的演进过程
+
+**分析报告模板**：
+```
+文件: amdgpu_pm.c
+创建时间: YYYY-MM-DD
+总提交次数: XXX
+主要贡献者:
+  - 开发者A (XX 次提交)
+  - 开发者B (YY 次提交)
+  - 开发者C (ZZ 次提交)
+
+关键里程碑:
+  1. YYYY-MM-DD: 首次添加电源管理框架
+  2. YYYY-MM-DD: 引入 hwmon 接口支持
+  3. YYYY-MM-DD: 添加 OverDrive 支持
+  4. YYYY-MM-DD: 重构 SMU 通信层
+  5. YYYY-MM-DD: 修复竞态条件问题
+
+近期活跃度: 过去一年 XX 次提交
+```
+
+#### 练习八：DPM 性能分析报告模板
+
+```bash
+#!/bin/bash
+# dpm_perf_report.sh - 生成 DPM 性能分析报告
+
+REPORT_FILE="dpm_perf_report_$(hostname)_$(date +%Y%m%d).txt"
+
+{
+    echo "=============================================="
+    echo " AMDGPU DPM 性能分析报告"
+    echo " 生成时间: $(date)"
+    echo " 主机名: $(hostname)"
+    echo " GPU: $(lspci | grep VGA | head -1 | cut -d: -f3)"
+    echo " 内核版本: $(uname -r)"
+    echo "=============================================="
+    echo ""
+    
+    echo "1. DPM 版本信息"
+    echo "----------------------------------------------"
+    cat /sys/class/drm/card0/device/pp_fw_version 2>/dev/null || echo "N/A"
+    cat /sys/class/drm/card0/device/pp_dpm_sclk 2>/dev/null | head -5
+    echo ""
+    
+    echo "2. 当前性能状态"
+    echo "----------------------------------------------"
+    cat /sys/class/drm/card0/device/power_dpm_state 2>/dev/null
+    cat /sys/class/drm/card0/device/power_dpm_force_performance_level 2>/dev/null
+    echo ""
+    
+    echo "3. 温度与功耗"
+    echo "----------------------------------------------"
+    for hwmon in /sys/class/drm/card0/device/hwmon/hwmon*; do
+        echo "--- $(basename $hwmon) ---"
+        cat $hwmon/name 2>/dev/null
+        cat $hwmon/temp1_input 2>/dev/null | awk '{print "温度: " $1/1000 " °C"}'
+        cat $hwmon/power1_average 2>/dev/null | awk '{print "功耗: " $1/1000000 " W"}'
+    done
+    echo ""
+    
+    echo "4. DPM 配置"
+    echo "----------------------------------------------"
+    cat /sys/class/drm/card0/device/pp_power_profile_mode 2>/dev/null
+    echo ""
+    
+    echo "5. 驱动消息（最近 20 条）"
+    echo "----------------------------------------------"
+    dmesg | grep -i amdgpu | tail -20
+    
+    echo ""
+    echo "=============================================="
+    echo " 报告生成完毕"
+    echo "=============================================="
+    
+} > $REPORT_FILE
+
+echo "报告已保存至: $REPORT_FILE"
+cat $REPORT_FILE | head -30
+echo "..."
+echo "(报告共 $(wc -l < $REPORT_FILE) 行)"
+```
